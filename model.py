@@ -13,35 +13,42 @@ class CharTokenizer(Tokenizer):
         return prefix + [x for x in text if ord(x) < 128]
 
 
-def get_space_preds(orig_txt: str, model: SequentialRNN, vocab:Vocab):
+def get_space_preds(orig_txt: str, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab):
     orig_txt = ['bos'] + [x for x in orig_txt]
     txt = vocab.numericalize(orig_txt)
-    model.eval()
-    model.reset()
-    inp = torch.LongTensor([txt, txt]).t().cuda()
-    print(inp.size())
-    forward_preds = model(inp)[0]
-    print("PREDS", forward_preds.size())
-    forward_preds = forward_preds.argmax(-1).view(inp.size(0), -1)
-    print("ARGMAX", forward_preds.size())
-    forward_preds = ''.join(vocab.itos[x] for x in forward_preds[:, 0])[:-1]
+    bwd_txt = list(reversed(txt))
+    forward_preds = predict(model, txt, vocab)
+    backward_preds = ''.join(x for x in predict(bwd_model, bwd_txt, vocab)[::-1])
     orig_txt = ''.join(orig_txt[1:])
     print(orig_txt)
     print(forward_preds)
+    print(backward_preds)
     for i in range(0, len(orig_txt)):
         if txt[i] != ' ' and forward_preds[i] == ' ':
             start = max(0, i-10)
             end = min(len(orig_txt), i+10)
-            print("ACTUAL", orig_txt[start:end])
-            print("PREDICTED", forward_preds[start:i-1] + '@ @' + forward_preds[i:end])
+            print("INDEX", i)
+            print("ACTUAL vs PREDICTED")
+            print(orig_txt[start:end])
+            print(forward_preds[start:end])
+
+
+def predict(model, txt, vocab):
+    model.eval()
+    model.reset()
+    inp = torch.LongTensor([txt, txt]).t().cuda()
+    forward_preds = model(inp)[0]
+    forward_preds = forward_preds.argmax(-1).view(inp.size(0), -1)
+    forward_preds = ''.join(vocab.itos[x] for x in forward_preds[:, 0])[:-1]
+    return forward_preds
+
 
 if __name__ == '__main__':
-    databunch = TextLMDataBunch.from_csv('/data/char-lm-fastai',
-                                         tokenizer=CharTokenizer(),
-                                         chunksize=1024,
-                                         max_vocab=128,
-                                         clear_cache=True)
-
+    databunch = TextFileList.from_folder('/data/hp/0').label_const(0).split_by_folder().datasets(FilesTextDataset)\
+        .tokenize(CharTokenizer())\
+        .numericalize()\
+        .databunch(TextLMDataBunch)
+    databunch.save('tmp_char_lm')
 
 class CharRNNCore(nn.Module):
     "AWD-LSTM/QRNN inspired by https://arxiv.org/abs/1708.02182."
