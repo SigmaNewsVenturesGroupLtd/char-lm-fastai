@@ -14,15 +14,16 @@ class CharTokenizer(Tokenizer):
 
 
 def get_space_preds(orig_txt: str, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab):
-    orig_txt = ['bos'] + [x for x in orig_txt]
+    orig_txt = [x for x in orig_txt]
     txt = vocab.numericalize(orig_txt)
     bwd_txt = list(reversed(txt))
-    forward_preds = predict(model, txt, vocab)
-    backward_preds = ''.join(x for x in predict(bwd_model, bwd_txt, vocab)[::-1])
-    orig_txt = ''.join(orig_txt[1:])
-    print(orig_txt)
-    print(forward_preds)
-    print(backward_preds)
+    print(txt, bwd_txt)
+    forward_preds = predict(model, txt, vocab)[:-2]
+    backward_preds = ''.join(x for x in predict(bwd_model, bwd_txt, vocab)[::-1])[2:]
+    orig_txt = ''.join(orig_txt[1:-1])
+    print(orig_txt, len(orig_txt))
+    print(forward_preds, len(forward_preds))
+    print(backward_preds, len(backward_preds))
     for i in range(0, len(orig_txt)):
         if txt[i] != ' ' and forward_preds[i] == ' ':
             start = max(0, i-10)
@@ -36,10 +37,10 @@ def get_space_preds(orig_txt: str, model: SequentialRNN, bwd_model: SequentialRN
 def predict(model, txt, vocab):
     model.eval()
     model.reset()
-    inp = torch.LongTensor([txt, txt]).t().cuda()
+    inp = torch.LongTensor([txt]).t().cuda()
     forward_preds = model(inp)[0]
     forward_preds = forward_preds.argmax(-1).view(inp.size(0), -1)
-    forward_preds = ''.join(vocab.itos[x] for x in forward_preds[:, 0])[:-1]
+    forward_preds = ''.join(vocab.itos[x] for x in forward_preds[:, 0])
     return forward_preds
 
 
