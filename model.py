@@ -2,6 +2,7 @@ from fastai import *
 from fastai.text import *
 
 
+
 class CharTokenizer(Tokenizer):
 
     def process_all(self, texts):
@@ -13,31 +14,54 @@ class CharTokenizer(Tokenizer):
         return prefix + [x for x in text if ord(x) < 128]
 
 
-def get_space_preds(orig_txt: str, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab):
-    orig_txt = [x for x in orig_txt]
+def get_space_preds(orig_txt: str, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab, word_vocab:set):
+    orig_txt = ['bos'] + [x for x in orig_txt] + ['bos']
     txt = vocab.numericalize(orig_txt)
     bwd_txt = list(reversed(txt))
-    print(txt, bwd_txt)
-    forward_preds = predict(model, txt, vocab)[:-2]
+    forward_preds = predict(model, txt, vocab)[0:-2]
     backward_preds = ''.join(x for x in predict(bwd_model, bwd_txt, vocab)[::-1])[2:]
     orig_txt = ''.join(orig_txt[1:-1])
-    print(orig_txt, len(orig_txt))
-    print(forward_preds, len(forward_preds))
-    print(backward_preds, len(backward_preds))
-    for i in range(0, len(orig_txt)):
-        if txt[i] != ' ' and forward_preds[i] == ' ':
-            start = max(0, i-10)
-            end = min(len(orig_txt), i+10)
-            print("INDEX", i)
-            print("ACTUAL vs PREDICTED")
-            print(orig_txt[start:end])
-            print(forward_preds[start:end])
+    for i in range(1, len(orig_txt)):
+        if orig_txt[i] != ' ' and forward_preds[i] == ' ' and backward_preds[i-1] == ' ':
+            concordance_len = 20
+            start = max(0, i - concordance_len)
+            end = min(len(orig_txt), i + concordance_len)
+            r_num_chars = orig_txt[i:end].find(' ')
+            l_index = orig_txt[start:i-1].rfind(' ')
+            l_num_chars = len(orig_txt[start:i - 1]) - l_index if l_index > 0 else 0
 
+            wordlen = l_num_chars + r_num_chars
+
+            if wordlen > 6 and r_num_chars >= 3 and l_num_chars >= 3:
+                word = orig_txt[i-l_num_chars:i+r_num_chars]
+                l_word = orig_txt[i-l_num_chars:i]
+                r_word = orig_txt[i:i+r_num_chars]
+                if word not in word_vocab and l_word in word_vocab and r_word in word_vocab:
+                    with_split = orig_txt[:i] + ' ' + orig_txt[i:]
+                    orig_score = score_txt(orig_txt, model, vocab) + score_txt(orig_txt[::-1], bwd_model, vocab)
+                    split_score = score_txt(with_split, model, vocab) + score_txt(with_split[::-1], bwd_model, vocab)
+                    if split_score > orig_score:
+                        print("splitting", orig_txt[start:end], 'to', orig_txt[start:i] + ' ' + orig_txt[i:end])
+                    else:
+                        pass
+                    #print("score too low", orig_txt[start:end], 'to', orig_txt[start:i] + ' ' + orig_txt[i:end])
+
+
+def score_txt(txt, model, vocab):
+    numericalized = vocab.numericalize(['bos'] + [x for x in txt] + ['bos'])
+    model.reset()
+    model.eval()
+    inp = torch.LongTensor([numericalized]).t().cpu()
+    preds = F.log_softmax(model(inp)[0], dim=0)
+    score = 0.
+    for pred, actual in zip(preds, numericalized[1:]):
+        score += pred[actual]
+    return score / len(txt)
 
 def predict(model, txt, vocab):
     model.eval()
     model.reset()
-    inp = torch.LongTensor([txt]).t().cuda()
+    inp = torch.LongTensor([txt]).t().cpu()
     forward_preds = model(inp)[0]
     forward_preds = forward_preds.argmax(-1).view(inp.size(0), -1)
     forward_preds = ''.join(vocab.itos[x] for x in forward_preds[:, 0])
