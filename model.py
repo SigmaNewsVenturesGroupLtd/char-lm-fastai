@@ -1,6 +1,6 @@
 from fastai import *
 from fastai.text import *
-
+from torch.nn.utils.rnn import pack_sequence, pad_packed_sequence
 
 
 class CharTokenizer(Tokenizer):
@@ -14,37 +14,48 @@ class CharTokenizer(Tokenizer):
         return prefix + [x for x in text if ord(x) < 128]
 
 
-def get_space_preds(orig_txt: str, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab, word_vocab:set):
-    orig_txt = ['bos'] + [x for x in orig_txt] + ['bos']
-    txt = vocab.numericalize(orig_txt)
-    bwd_txt = list(reversed(txt))
-    forward_preds = predict(model, txt, vocab)[0:-2]
-    backward_preds = ''.join(x for x in predict(bwd_model, bwd_txt, vocab)[::-1])[2:]
-    orig_txt = ''.join(orig_txt[1:-1])
-    for i in range(1, len(orig_txt)):
-        if orig_txt[i] != ' ' and forward_preds[i] == ' ' and backward_preds[i-1] == ' ':
-            concordance_len = 20
-            start = max(0, i - concordance_len)
-            end = min(len(orig_txt), i + concordance_len)
-            r_num_chars = orig_txt[i:end].find(' ')
-            l_index = orig_txt[start:i-1].rfind(' ')
-            l_num_chars = len(orig_txt[start:i - 1]) - l_index if l_index > 0 else 0
+def get_space_preds(txts: list, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab, word_vocab:set):
+    sequences = [ torch.LongTensor(vocab.numericalize(['bos'] + [x for x in txt] + ['bos'])) for txt in txts ]
+    sorted_sequences = sorted(sequences, key=lambda x: x.size(), reverse=True)
+    packed_sequences = pack_sequence(sorted_sequences)
+    padded_sequences, lens = pad_packed_sequence(packed_sequences)
+    forward_preds = predict(model, padded_sequences, lens, vocab)
 
-            wordlen = l_num_chars + r_num_chars
 
-            if wordlen > 6 and r_num_chars >= 3 and l_num_chars >= 3:
-                word = orig_txt[i-l_num_chars:i+r_num_chars]
-                l_word = orig_txt[i-l_num_chars:i]
-                r_word = orig_txt[i:i+r_num_chars]
-                if word not in word_vocab and l_word in word_vocab and r_word in word_vocab:
-                    with_split = orig_txt[:i] + ' ' + orig_txt[i:]
-                    orig_score = score_txt(orig_txt, model, vocab) + score_txt(orig_txt[::-1], bwd_model, vocab)
-                    split_score = score_txt(with_split, model, vocab) + score_txt(with_split[::-1], bwd_model, vocab)
-                    if split_score > orig_score:
-                        print("splitting", orig_txt[start:end], 'to', orig_txt[start:i] + ' ' + orig_txt[i:end])
-                    else:
-                        pass
-                    #print("score too low", orig_txt[start:end], 'to', orig_txt[start:i] + ' ' + orig_txt[i:end])
+
+    reversed_sorted_sequences = sorted([torch.LongTensor(s.numpy()[::-1].copy()) for s in sequences], key=lambda x:x.size(), reverse=True)
+    r_packed_sequences = pack_sequence(reversed_sorted_sequences)
+    r_padded_sequences, r_lens = pad_packed_sequence(r_packed_sequences)
+    backward_preds = predict(bwd_model, r_padded_sequences, r_lens, vocab)
+
+    for seq_idx, seq in enumerate(sorted_sequences):
+        orig_txt = [vocab.itos[x] for x in seq[1:-1]]
+        fwd_pred = forward_preds[seq_idx][:-2]
+        bwd_pred = backward_preds[seq_idx][:-2][::-1]
+        for i in range(1, len(orig_txt)):
+            if orig_txt[i] != ' ' and fwd_pred[i] == ' ' and bwd_pred[i-1] == ' ':
+                concordance_len = 20
+                start = max(0, i - concordance_len)
+                end = min(len(orig_txt), i + concordance_len)
+                r_num_chars = orig_txt[i:end].index(' ') if ' ' in orig_txt[i:end] else 0
+                l_num_chars = orig_txt[start:i][::-1].index(' ') if ' ' in orig_txt[start:i] else 0
+
+                wordlen = l_num_chars + r_num_chars
+
+                if wordlen > 6 and r_num_chars >= 3 and l_num_chars >= 3:
+                    word = ''.join(orig_txt[i-l_num_chars:i+r_num_chars])
+                    l_word = ''.join(orig_txt[i-l_num_chars:i])
+                    r_word = ''.join(orig_txt[i:i+r_num_chars])
+
+                    if word not in word_vocab and l_word in word_vocab and r_word in word_vocab:
+                        with_split = ''.join(orig_txt[:i]) + ' ' + ''.join(orig_txt[i:])
+                        orig_score = score_txt(orig_txt, model, vocab) + score_txt(orig_txt[::-1], bwd_model, vocab)
+                        split_score = score_txt(with_split, model, vocab) + score_txt(with_split[::-1], bwd_model, vocab)
+                        if split_score > orig_score:
+                            print("splitting", ''.join(orig_txt[start:end]), '---->', ''.join(orig_txt[start:i]) + ' ' + ''.join(orig_txt[i:end]))
+                        else:
+                            pass
+                        #print("score too low", orig_txt[start:end], 'to', orig_txt[start:i] + ' ' + orig_txt[i:end])
 
 
 def score_txt(txt, model, vocab):
@@ -58,14 +69,17 @@ def score_txt(txt, model, vocab):
         score += pred[actual]
     return score / len(txt)
 
-def predict(model, txt, vocab):
+def predict(model, txt, lens, vocab):
     model.eval()
     model.reset()
-    inp = torch.LongTensor([txt]).t().cpu()
-    forward_preds = model(inp)[0]
-    forward_preds = forward_preds.argmax(-1).view(inp.size(0), -1)
-    forward_preds = ''.join(vocab.itos[x] for x in forward_preds[:, 0])
-    return forward_preds
+    forward_preds = model(txt)[0]
+    forward_preds = forward_preds.argmax(-1).view(txt.size(0), -1).t()
+    res = []
+    for row_idx in range(txt.size(1)):
+        cur_len = lens[row_idx]
+        cur_preds = forward_preds[row_idx]
+        res.append(''.join(vocab.itos[cur_preds[i]] for i in range(cur_len)))
+    return res
 
 
 if __name__ == '__main__':

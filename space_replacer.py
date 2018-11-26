@@ -20,9 +20,9 @@ bwd_learn = language_model_learner(databunch, emb_sz=100, nh=300, nl=1, drop_mul
 bwd_learn.load('/data/char-lm-fastai/models/bwd-1.044461')
 bwd = bwd_learn.model.cpu()
 
+bs=2048
 
-
-for line in open('/data/char-lm-fastai/train.jsonl'):
-    doc = json.loads(line)
-    text = doc['tokens']
+for i, chunk in enumerate(pd.read_json('/data/char-lm-fastai/train.jsonl', lines=True, chunksize=bs)):
+    print(f"Processing {i*bs}")
+    text = chunk['tokens']
     get_space_preds(text, fwd, bwd, vocab, word_vocab)
