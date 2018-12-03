@@ -14,27 +14,23 @@ class CharTokenizer(Tokenizer):
         return prefix + [x for x in text if ord(x) < 128]
 
 
-def get_space_preds(txts: list, model: SequentialRNN, bwd_model: SequentialRNN, vocab:Vocab, word_vocab:set):
-    sequences = [ torch.LongTensor(vocab.numericalize(['bos'] + [x for x in txt] + ['bos'])) for txt in txts ]
-    sorted_sequences = sorted(sequences, key=lambda x: x.size(), reverse=True)
-    packed_sequences = pack_sequence(sorted_sequences)
-    padded_sequences, lens = pad_packed_sequence(packed_sequences)
-    forward_preds = predict(model, padded_sequences, lens, vocab)
+def get_space_preds(txts: list, model: SequentialRNN, bwd_model: SequentialRNN, vocab: Vocab, word_vocab: set):
+    sequences = [torch.LongTensor(vocab.numericalize(['bos'] + [x for x in txt] + ['bos'])) for txt in txts ]
+    fwd_sequences, lens = get_sequences(sequences)
+    bwd_sequences, bwd_lens = get_sequences(sequences, reverse=True)
 
+    forward_preds = predict(model, fwd_sequences, lens, vocab)
+    backward_preds = predict(bwd_model, bwd_sequences, bwd_lens, vocab)
 
-
-    reversed_sorted_sequences = sorted([torch.LongTensor(s.numpy()[::-1].copy()) for s in sequences], key=lambda x:x.size(), reverse=True)
-    r_packed_sequences = pack_sequence(reversed_sorted_sequences)
-    r_padded_sequences, r_lens = pad_packed_sequence(r_packed_sequences)
-    backward_preds = predict(bwd_model, r_padded_sequences, r_lens, vocab)
-
-    for seq_idx, seq in enumerate(sorted_sequences):
-        orig_txt = [vocab.itos[x] for x in seq[1:-1]]
-        fwd_pred = forward_preds[seq_idx][:-2]
-        bwd_pred = backward_preds[seq_idx][:-2][::-1]
+    dirty = []
+    clean = []
+    for seq_idx, (seq,seq_len, fwd_pred, bwd_pred) in enumerate(zip(fwd_sequences.t(), lens, forward_preds, backward_preds)):
+        orig_txt = [vocab.itos[x] for x in seq[1:seq_len-1] if x != 1]
+        fwd_pred = fwd_pred[:-1]
+        bwd_pred = bwd_pred[:-1][::-1]
         for i in range(1, len(orig_txt)):
-            if orig_txt[i] != ' ' and fwd_pred[i] == ' ' and bwd_pred[i-1] == ' ':
-                concordance_len = 20
+            if orig_txt[i] != ' ' and fwd_pred[i] == ' ' and bwd_pred[i] == ' ':
+                concordance_len = 30
                 start = max(0, i - concordance_len)
                 end = min(len(orig_txt), i + concordance_len)
                 r_num_chars = orig_txt[i:end].index(' ') if ' ' in orig_txt[i:end] else 0
@@ -42,7 +38,7 @@ def get_space_preds(txts: list, model: SequentialRNN, bwd_model: SequentialRNN, 
 
                 wordlen = l_num_chars + r_num_chars
 
-                if wordlen > 6 and r_num_chars >= 3 and l_num_chars >= 3:
+                if wordlen >= 5 and (r_num_chars >= 3 or l_num_chars >= 3):
                     word = ''.join(orig_txt[i-l_num_chars:i+r_num_chars])
                     l_word = ''.join(orig_txt[i-l_num_chars:i])
                     r_word = ''.join(orig_txt[i:i+r_num_chars])
@@ -52,33 +48,60 @@ def get_space_preds(txts: list, model: SequentialRNN, bwd_model: SequentialRNN, 
                         orig_score = score_txt(orig_txt, model, vocab) + score_txt(orig_txt[::-1], bwd_model, vocab)
                         split_score = score_txt(with_split, model, vocab) + score_txt(with_split[::-1], bwd_model, vocab)
                         if split_score > orig_score:
-                            print("splitting", ''.join(orig_txt[start:end]), '---->', ''.join(orig_txt[start:i]) + ' ' + ''.join(orig_txt[i:end]))
-                        else:
-                            pass
-                        #print("score too low", orig_txt[start:end], 'to', orig_txt[start:i] + ' ' + orig_txt[i:end])
+                            dirty.append(''.join(orig_txt[start:end]))
+                            clean.append(''.join(orig_txt[start:i]) + ' ' + ''.join(orig_txt[i:end]))
+    return pd.DataFrame({'dirty': dirty, 'clean': clean})
 
 
-def score_txt(txt, model, vocab):
+def get_sequences(sequences:list, reverse=False):
+    """
+    Transforms a list of LongTensors to a padded long tensor
+    :param sequences:
+    :param reverse:
+    :return: a tuple res, lens where res is of shape TxB and lens is the lengths of the items in the batch.
+    """
+    if reverse:
+        sequences = [torch.LongTensor(s.numpy()[::-1].copy()) for s in sequences]
+    sorted_sequences = sorted(sequences, key=lambda x: x.size(), reverse=True)
+    packed_sequences = pack_sequence(sorted_sequences)
+    return pad_packed_sequence(packed_sequences, padding_value=1)
+
+
+def score_txt(txt:str, model:nn.Module, vocab: Vocab):
+    """
+    Computes the average log likelihood of the text under the model
+    :param txt:
+    :param model:
+    :param vocab:
+    :return:
+    """
     numericalized = vocab.numericalize(['bos'] + [x for x in txt] + ['bos'])
     model.reset()
     model.eval()
-    inp = torch.LongTensor([numericalized]).t().cpu()
+    inp = torch.LongTensor([numericalized]).t()
     preds = F.log_softmax(model(inp)[0], dim=0)
     score = 0.
     for pred, actual in zip(preds, numericalized[1:]):
         score += pred[actual]
     return score / len(txt)
 
-def predict(model, txt, lens, vocab):
+
+def predict(model: nn.Module, txt:torch.LongTensor, lens:np.array, vocab: Vocab):
+    """
+    Applies the model and returns the results as a string
+    :param model:
+    :param txt:
+    :param lens:
+    :param vocab:
+    :return:
+    """
     model.eval()
     model.reset()
     forward_preds = model(txt)[0]
     forward_preds = forward_preds.argmax(-1).view(txt.size(0), -1).t()
     res = []
-    for row_idx in range(txt.size(1)):
-        cur_len = lens[row_idx]
-        cur_preds = forward_preds[row_idx]
-        res.append(''.join(vocab.itos[cur_preds[i]] for i in range(cur_len)))
+    for preds, length in zip(forward_preds, lens):
+        res.append(''.join(vocab.itos[preds[i]] for i in range(length)))
     return res
 
 
@@ -89,19 +112,31 @@ if __name__ == '__main__':
         .databunch(TextLMDataBunch)
     databunch.save('tmp_char_lm')
 
+
+def indexes_to_one_hot(indexes, n_dims=None):
+    """Converts a vector of indexes to a batch of one-hot vectors. """
+    indexes = indexes.type(torch.int64).contiguous().view(-1, 1)
+    n_dims = n_dims if n_dims is not None else int(torch.max(indexes)) + 1
+    one_hots = torch.zeros(indexes.size()[0], n_dims).cuda().scatter_(1, indexes, 1)
+    one_hots = one_hots.view(*indexes.shape, -1)
+    return one_hots
+
+
 class CharRNNCore(nn.Module):
     "AWD-LSTM/QRNN inspired by https://arxiv.org/abs/1708.02182."
 
     initrange=0.1
 
-    def __init__(self, vocab_sz:int, emb_sz:int, n_hid:int, n_layers:int, bidir:bool=False,
-                 hidden_p:float=0.2, input_p:float=0.6, weight_p:float=0.5):
+    def __init__(self, vocab_sz:int, emb_sz:int, n_hid:int, n_layers:int, pad_token:int, bidir:bool=False,
+                 hidden_p:float=0.2, input_p:float=0.6, embed_p:float=0.1, weight_p:float=0.5):
 
         super().__init__()
-        self.bs,self.ndir = 1, (2 if bidir else 1)
-        self.n_hid,self.n_layers = n_hid, n_layers
-        self.rnns = [nn.LSTM(vocab_sz if l == 0 else n_hid, (n_hid if l != n_layers - 1 else emb_sz)//self.ndir,
-                1, bidirectional=bidir) for l in range(n_layers)]
+        self.bs,self.ndir = 1,(2 if bidir else 1)
+        self.emb_sz,self.n_hid,self.n_layers = emb_sz,n_hid,n_layers
+        self.encoder = nn.Embedding(vocab_sz, emb_sz, padding_idx=pad_token)
+        self.encoder_dp = EmbeddingDropout(self.encoder, embed_p)
+        self.rnns = [nn.LSTM(emb_sz if l == 0 else n_hid, n_hid // self.ndir,
+            1, bidirectional=bidir) for l in range(n_layers)]
         self.rnns = [WeightDropout(rnn, weight_p) for rnn in self.rnns]
         self.rnns = torch.nn.ModuleList(self.rnns)
         self.encoder.weight.data.uniform_(-self.initrange, self.initrange)
@@ -113,7 +148,7 @@ class CharRNNCore(nn.Module):
         if bs!=self.bs:
             self.bs=bs
             self.reset()
-        raw_output = input
+        raw_output = self.input_dp(self.encoder_dp(input))
         new_hidden,raw_outputs,outputs = [],[],[]
         for l, (rnn,hid_dp) in enumerate(zip(self.rnns, self.hidden_dps)):
             raw_output, new_h = rnn(raw_output, self.hidden[l])
@@ -126,12 +161,11 @@ class CharRNNCore(nn.Module):
 
     def _one_hidden(self, l:int)->Tensor:
         "Return one hidden state."
-        nh = (self.n_hid if l != self.n_layers - 1 else self.emb_sz)//self.ndir
+        nh = self.n_hid//self.ndir
         return self.weights.new(self.ndir, self.bs, nh).zero_()
 
     def reset(self):
         "Reset the hidden states."
         [r.reset() for r in self.rnns if hasattr(r, 'reset')]
         self.weights = next(self.parameters()).data
-        if self.qrnn: self.hidden = [self._one_hidden(l) for l in range(self.n_layers)]
-        else: self.hidden = [(self._one_hidden(l), self._one_hidden(l)) for l in range(self.n_layers)]
+        self.hidden = [(self._one_hidden(l), self._one_hidden(l)) for l in range(self.n_layers)]
